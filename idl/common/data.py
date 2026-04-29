@@ -12,6 +12,7 @@ def get_datasets_and_loaders(dataset: str,
                              batch_size: int,
                              num_workers: int = 0,
                              root: str = "data",
+                             augment_transforms: list[Transform] | None = None,
                              verbose: bool = True) \
                                 -> tuple[datasets.VisionDataset,
                                          datasets.VisionDataset,
@@ -30,6 +31,7 @@ def get_datasets_and_loaders(dataset: str,
         batch_size: Guess what!
         num_workers: Used by DataLoader.
         root: Base path where datasets should be stored/looked for.
+        augment_transforms: Transforms you want to be applied only to the training data, i.e. data augmentation.
         verbose: If True, print some info about the dataset elements (shape and dtype), as well as plotting some example
                  images.
     """
@@ -40,6 +42,9 @@ def get_datasets_and_loaders(dataset: str,
     to_float = ToDtype(torch.float32, scale=True)
     train_transforms.append(to_float)
     test_transforms.append(to_float)
+
+    if augment_transforms is not None:
+        train_transforms += augment_transforms
 
     train_transforms = Compose(train_transforms)
     test_transforms = Compose(test_transforms)
