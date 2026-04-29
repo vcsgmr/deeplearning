@@ -2,3 +2,4 @@
 *.gz
 data/*
 *.pyc
+*events.out.tfevents*
