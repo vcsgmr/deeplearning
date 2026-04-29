@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 
 from .utils import accuracy, plot_image_grid
@@ -20,6 +21,7 @@ class TrainerBase:
                  validation_loader: DataLoader,
                  n_epochs: int,
                  device: str,
+                 logger: TensorboardLogger | None = None,
                  verbose: bool = True,
                  use_tqdm: bool = False):
         """Base class for training generative models.
@@ -32,6 +34,7 @@ class TrainerBase:
             training_loader, validation_loader: Dataloaders for training/validation sets.
             n_epochs: Number of full iterations over the training loader.
             device: Device on which all the torch stuff should happen (e.g. "cuda").
+            logger: Optional TensorboardLogger instance for logging with Tensorboard.
             verbose: If True, report on training progress throughout.
             use_tqdm: If True, and verbose is also True, supply per-epoch progress bars.
         """
@@ -45,6 +48,9 @@ class TrainerBase:
 
         self.verbose = verbose
         self.use_tqdm = use_tqdm
+
+        self.logger = logger
+        self.global_step = 0
 
         self.full_metrics = defaultdict(list)
 
@@ -64,7 +70,7 @@ class TrainerBase:
         
         self.optimizer.zero_grad()  # safety first!
         for epoch_ind in tqdm(iterable=range(self.n_epochs), desc="Overall progress", leave=True,
-                          disable=not self.use_tqdm or not self.verbose):
+                              disable=not self.use_tqdm or not self.verbose):
             epoch_train_metrics = self.train_epoch(epoch_ind)
             self.finish_epoch(epoch_train_metrics, epoch_ind)
 
@@ -89,12 +95,18 @@ class TrainerBase:
         self.model.train()
         # manual progressbar required due to multiprocessing in dataloaders
         with tqdm(total=len(self.training_loader), desc=f"Training", leave=False,
-                    disable=not self.use_tqdm or not self.verbose) as progressbar:
+                  disable=not self.use_tqdm or not self.verbose) as progressbar:
             for data_batch in self.training_loader:
                 batch_losses = self.train_step(data_batch)
                 for key in batch_losses:
                     epoch_train_metrics[key].append(batch_losses[key])
+                    if self.logger is not None:
+                        self.logger.log_batch_value(tag=f"batch_{key}",
+                                                    value=batch_losses[key],
+                                                    step_ind=self.global_step)
+
                 progressbar.update(1)
+                self.global_step += 1
         
         end_time = perf_counter()
         time_taken = end_time - start_time
@@ -129,12 +141,18 @@ class TrainerBase:
 
             self.full_metrics["val_" + key].append(val_metric)
             self.full_metrics["train_" + key].append(train_metric)
+            if self.logger is not None:
+                self.logger.log_epoch_values(tag=f"epoch_{key}",
+                                             tag_value_dict={"training": train_metric, "validation": val_metric},
+                                             epoch_ind=epoch_ind)
 
         if self.verbose:
             print("\tMetrics:")
             for key in self.full_metrics:
                 print(f"\t\t{key}: {self.full_metrics[key][-1]:.6g}")
             print()
+        if self.logger is not None:
+            self.logger.flush()
 
     def evaluate(self) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """One evaluation loop.
@@ -178,6 +196,11 @@ class TrainerBase:
         """
         batch_loss_full, batch_losses = self.core_step(data_batch)
         batch_loss_full.backward()
+
+        if self.logger is not None:
+            self.logger.log_gradients(self.model, self.global_step)
+            self.logger.log_images(data_batch[0], self.global_step)
+
         self.optimizer.step()
         self.optimizer.zero_grad()
 
@@ -271,3 +294,50 @@ class ClassifierTrainer(TrainerBase):
             true_here = y[ind]
             subtitles.append(f"true: {classes[true_here]} pred: {classes[pred_here]}\nprob: {prob_here:.3f}")
         plot_image_grid(inputs, figure_size=(12, 12), title="Classifications", subtitles=subtitles, n_rows=plot_n_rows)
+
+
+class TensorboardLogger:
+    def __init__(self,
+                 logdir: str,
+                 step_frequency: int = 100,
+                 do_log_batch_values: bool = True,
+                 do_log_gradients: bool = True,
+                 do_log_images: bool = True):
+        self.logdir = logdir
+        self.writer = SummaryWriter(logdir)
+        self.step_frequency = step_frequency
+
+        self.do_log_batch_values = do_log_batch_values
+        self.do_log_gradients = do_log_gradients
+        self.do_log_images = do_log_images
+
+    def log_batch_value(self,
+                        tag: str,
+                        value: torch.Tensor,
+                        step_ind: int):
+        if self.do_log_batch_values and not step_ind % self.step_frequency:
+            self.writer.add_scalar(tag=tag, scalar_value=value, global_step=step_ind)
+
+    def log_epoch_values(self,
+                         tag: str,
+                         tag_value_dict: dict[str, torch.Tensor],
+                         epoch_ind: int):
+        self.writer.add_scalars(main_tag=tag, tag_scalar_dict=tag_value_dict, global_step=epoch_ind)
+
+    def log_gradients(self,
+                      model: nn.Module,
+                      step_ind: int):
+        if self.do_log_gradients and not step_ind % self.step_frequency:
+            for name, parameter in model.named_parameters():
+                with torch.no_grad():
+                    gradient_norm = torch.sqrt((parameter.grad**2).sum())
+                self.writer.add_scalar(tag=f"gradient_{name}", scalar_value=gradient_norm, global_step=step_ind)
+
+    def log_images(self,
+                   images: torch.Tensor,
+                   step_ind: int):
+        if self.do_log_images and not step_ind % self.step_frequency:
+            self.writer.add_images(tag="input_images", img_tensor=images, global_step=step_ind)
+
+    def flush(self):
+        self.writer.flush()
