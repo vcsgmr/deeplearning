@@ -12,6 +12,7 @@ def plot_image_grid(images: torch.Tensor,
                     n_rows: int,
                     n_cols: int | None = None,
                     subtitles: Iterable[str] | None = None,
+                    tight_layout: bool = False,
                     colormap="Greys"):
     """Display a rectangular grid of images.
 
@@ -24,8 +25,8 @@ def plot_image_grid(images: torch.Tensor,
         n_cols: Will plot this many columns of examples. Defaults to n_rows.
         subtitles: If given, should be an iterable of strings of the same length as images. Each string will be used as
                    title for the respective image's subplot.
+        tight_layout: If True, use plt.tight_layout().
         colormap: Which colormap to use to display images. Only used for single-channel images.
-        Other arguments: Please see lgm.common.TrainerBase. Everything below writer is only used if that is not None.
     """
     if n_cols is None:
             n_cols = n_rows
@@ -39,6 +40,8 @@ def plot_image_grid(images: torch.Tensor,
         if subtitles is not None:
              plt.title(subtitles[ind], fontsize=8)
     plt.suptitle(title)
+    if tight_layout:
+         plt.tight_layout()
     plt.show()
 
 

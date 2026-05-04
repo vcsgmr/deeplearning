@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
+from itertools import chain
 from time import perf_counter
 
 import numpy as np
@@ -22,9 +24,11 @@ class TrainerBase:
                  n_epochs: int,
                  device: str,
                  logger: TensorboardLogger | None = None,
+                 early_stopper: EarlyStopping | None = None,
+                 scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
                  verbose: bool = True,
                  use_tqdm: bool = False):
-        """Base class for training generative models.
+        """Base class for training models.
 
         Any Trainer for a specific kind of model should inherit from this and implement the core_step function.
 
@@ -35,11 +39,16 @@ class TrainerBase:
             n_epochs: Number of full iterations over the training loader.
             device: Device on which all the torch stuff should happen (e.g. "cuda").
             logger: Optional TensorboardLogger instance for logging with Tensorboard.
+            early_stopper: Optional early stopping object. Pass None to disable early stopping.
+            scheduler: Learning rate scheduler. NOTE that this is applied every training STEP, EXCEPT if it's a
+                       ReduceLROnPlateau instance, in which case it's applied once after each EPOCH.
             verbose: If True, report on training progress throughout.
             use_tqdm: If True, and verbose is also True, supply per-epoch progress bars.
         """
         self.model = model
         self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.early_stopper = early_stopper
 
         self.training_loader = training_loader
         self.validation_loader = validation_loader
@@ -72,7 +81,10 @@ class TrainerBase:
         for epoch_ind in tqdm(iterable=range(self.n_epochs), desc="Overall progress", leave=True,
                               disable=not self.use_tqdm or not self.verbose):
             epoch_train_metrics = self.train_epoch(epoch_ind)
-            self.finish_epoch(epoch_train_metrics, epoch_ind)
+            should_stop = self.finish_epoch(epoch_train_metrics, epoch_ind)
+            if should_stop:
+                print("Early stopping...")
+                break
 
         self.model.eval()
         # TODO make this prettier
@@ -105,6 +117,9 @@ class TrainerBase:
                                                     value=batch_losses[key],
                                                     step_ind=self.global_step)
 
+                if (self.scheduler is not None
+                    and not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)):
+                    self.scheduler.step()
                 progressbar.update(1)
                 self.global_step += 1
         
@@ -134,6 +149,13 @@ class TrainerBase:
             Boolean flag from early stopping.
         """
         val_loss_full, val_losses = self.evaluate()
+        if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            self.scheduler.step(val_loss_full)
+                
+        if self.early_stopper is not None:
+            should_stop = self.early_stopper.update(val_loss_full)
+        else:
+            should_stop = False
 
         for key in epoch_train_metrics:
             val_metric = val_losses[key].item()
@@ -150,9 +172,12 @@ class TrainerBase:
             print("\tMetrics:")
             for key in self.full_metrics:
                 print(f"\t\t{key}: {self.full_metrics[key][-1]:.6g}")
+            if self.scheduler is not None:
+                print(f"\tLR is now {self.scheduler.get_last_lr()[0]:.10g}")
             print()
         if self.logger is not None:
             self.logger.flush()
+        return should_stop
 
     def evaluate(self) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """One evaluation loop.
@@ -293,7 +318,8 @@ class ClassifierTrainer(TrainerBase):
             prob_here = probabilities[ind, pred_here].item()
             true_here = y[ind]
             subtitles.append(f"true: {classes[true_here]} pred: {classes[pred_here]}\nprob: {prob_here:.3f}")
-        plot_image_grid(inputs, figure_size=(12, 12), title="Classifications", subtitles=subtitles, n_rows=plot_n_rows)
+        plot_image_grid(inputs, figure_size=(12, 12), title="Classifications", subtitles=subtitles, n_rows=plot_n_rows,
+                        tight_layout=True)
 
 
 class TensorboardLogger:
@@ -341,3 +367,137 @@ class TensorboardLogger:
 
     def flush(self):
         self.writer.flush()
+
+
+class ParameterTracker:
+    def __init__(self,
+                 model: nn.Module,
+                 trainable_only: bool = False,
+                 include_buffers: bool = True):
+        """Base class for parameter trackers/storages like early stopping or Polyak averaging.
+
+        Parameters:
+            model: Model to track.
+            trainable_only: If True, we only create EMAs for trainable parameters. Otherwise, anything in the model
+                            state dict will be affected.
+            include_buffers: If True, also create EMAs for buffers (like Batchnorm moving averages). Only float-type
+                             buffers are used!
+        """
+        self.model = model
+        self.trainable_only = trainable_only
+        self.include_buffers = include_buffers
+        self.tracked_parameters = [param.detach().clone() for param in self.get_parameters()]
+        self.backup = []
+
+    def get_parameters(self) -> Iterable[torch.Tensor]:
+        """Return all desired parameters."""
+        if not self.include_buffers:
+            return iter(param for param in self.model.parameters() if param.requires_grad or not self.trainable_only)
+        return iter(param for param in chain(self.model.parameters(), self.model.buffers())
+                    if (param.requires_grad or not self.trainable_only) and torch.is_floating_point(param))
+    
+    @torch.no_grad()
+    def apply_parameters(self):
+        """Overwrite model parameters with EMA parameters while also creating a backup."""
+        self.make_backup()
+        for tracked_param, model_param in zip(self.tracked_parameters, self.get_parameters()):
+            model_param.copy_(tracked_param)
+
+    def make_backup(self):
+        """Make a backup of original model parameters."""
+        if not self.backup:
+            print("Creating backup...")
+            self.backup = [param.detach().clone() for param in self.get_parameters()]
+        else:
+            print("backup has been created already! This backup has been SKIPPED.")
+
+    @torch.no_grad()
+    def apply_backup(self):
+        """Restore backed up model parameters."""
+        for backup_param, model_param in zip(self.backup, self.get_parameters()):
+            model_param.copy_(backup_param)
+
+
+class EarlyStopping(ParameterTracker):
+    def __init__(self,
+                 model: nn.Module,
+                 patience: int,
+                 direction: str = "min",
+                 min_delta: float = 0.0001,
+                 verbose: bool = False,
+                 trainable_only: bool = False,
+                 include_buffers: bool = True,
+                 restore_best: bool = False):
+        """Stop training if target metric does not improve.
+
+        The model parameters with best performance are tracked and restored at the end.
+
+        Parameters:
+            model: Model to track.
+            patience: How many iterations without improvement to tolerate. For example, patience=2 means that two
+                      iterations *in a row* without improvement are okay; stopping would be triggered after the third
+                      iteration in arow without improvement.
+            direction: Whether the metric of interest is minimized (e.g. loss) or maximized (e.g. accuracy).
+            min_delta: An improvement is only counted as such if it is better by at least this amount.
+            verbose: If True, report on how things are going.
+            trainable_only: See notes in base class.
+            include_buffers: See notes in base class.
+            restore_best: If True, when the stop signal is triggered, the best parameters are restored to the model.
+                          Otherwise, you have to do this manually later.
+        """
+        super().__init__(model, trainable_only, include_buffers)
+        if direction not in ["min", "max"]:
+            raise ValueError(f"direction should be 'min' or 'max', you passed {direction}")
+        self.best_value = np.inf if direction == "min" else -np.inf
+        self.direction = direction
+        self.min_delta = min_delta
+
+        self.patience = patience
+        self.disappointment = 0
+        self.verbose = verbose
+        if verbose and patience is None:
+            print("EarlyStopping with patience None -- noop and will never stop")
+        self.restore_best = restore_best
+
+    def update(self,
+               value: torch.Tensor) -> bool:
+        """Run one 'iteration' of early stopping.
+
+        This updates the patience parameter, and if stopping is triggered, sends a signal to stop training. This
+        function does *not* actually stop the training process; this needs to be handled in the training function
+        based on the bool this function returns. *Optionally* restores the best tracked model parameters.
+
+        Parameters:
+            value: New value to compare to best so far.
+        """
+        if self.patience is None:
+            return False
+            
+        if ((self.direction == "min" and value < self.best_value - self.min_delta) 
+            or (self.direction == "max" and value > self.best_value + self.min_delta)):
+            self.best_value = value
+            self.update_best()
+            self.disappointment = 0
+            if self.verbose:
+                print("New best value found; no longer disappointed")
+            return False
+        # else
+        self.disappointment += 1
+        if self.verbose:
+            print(f"EarlyStopping disappointment increased to {self.disappointment}")
+
+        if self.disappointment > self.patience:
+            if self.verbose:
+                print("EarlyStopping has become too disappointed; now would be a good time to cancel training")
+                if self.restore_best:
+                    print("Restoring best model from state_dict")
+                    self.apply_parameters()
+            return True
+        #else
+        return False
+            
+    @torch.no_grad()
+    def update_best(self):
+        """Update saved state with new best."""
+        for best_param, model_param in zip(self.tracked_parameters, self.get_parameters()):
+            best_param.copy_(model_param)
