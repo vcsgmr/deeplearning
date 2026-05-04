@@ -26,7 +26,7 @@ class TrainerBase:
                  use_tqdm: bool = False):
         """Base class for training generative models.
 
-        Any Trainer for a specific kind of model should inherit fromt his and implement the core_step function.
+        Any Trainer for a specific kind of model should inherit from this and implement the core_step function.
 
         Parameters:
             model: The model to train.
